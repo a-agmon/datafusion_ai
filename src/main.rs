@@ -1,6 +1,9 @@
+use std::time::Instant;
+
 use datafusion::prelude::*;
 use datafusion_expr::ScalarUDF;
 mod llm_udf;
+mod llm_utils;
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     // register the table
@@ -25,9 +28,13 @@ async fn main() -> datafusion::error::Result<()> {
     let query = r#"
     SELECT "Order ID", "Customer ID", "Customer Feedback", 
         ask_llm('how satisfied is the customer [1-10]', "Customer Feedback") 
-    FROM sample_table limit 50
+    FROM sample_table 
+    limit 50
     "#;
+    let time_start = Instant::now();
     let df = ctx.sql(query).await?;
     df.show().await?;
+    let time_end = Instant::now();
+    println!("Time taken: {:?}", time_end.duration_since(time_start));
     Ok(())
 }

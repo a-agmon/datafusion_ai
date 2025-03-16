@@ -10,3 +10,7 @@ datafusion-common = "46.0.0"
 datafusion-expr = "46.0.0"
 datafusion-doc = "46.0.0"
 datafusion-macros = "46.0.0"
+rayon = "1.10.0"
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs.git" }
+anyhow = "1.0.97"
+encoding_rs = "0.8"

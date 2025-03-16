@@ -1,3 +1,4 @@
+use crate::llm_utils::LlamaApp;
 use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion_common::cast::{as_int64_array, as_string_array};
@@ -6,6 +7,7 @@ use datafusion_doc::Documentation;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, Signature, Volatility, col};
 use datafusion_expr::{ScalarUDF, ScalarUDFImpl};
 use datafusion_macros::user_doc;
+use rayon::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -72,14 +74,23 @@ impl ScalarUDFImpl for AskLLM {
             ) => {
                 let col_values = as_string_array(col_values.as_ref())?;
                 println!("instruction: {:?}", instruction);
-                let result = col_values
-                    .iter()
-                    .map(|value| {
-                        // just count the number of words in the value
-                        let num_words = value.unwrap_or_default().split_whitespace().count();
-                        format!("{} words", num_words)
+                let values: Vec<_> = col_values.iter().collect();
+                let chunk_size = 10; // Choose appropriate chunk size based on data volume
+
+                let result: Vec<String> = values
+                    .par_chunks(chunk_size)
+                    .flat_map(|chunk| {
+                        chunk
+                            .iter()
+                            .map(|value| {
+                                let num_words =
+                                    value.unwrap_or_default().split_whitespace().count();
+                                format!("{} words", num_words)
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<String>>();
+                    .collect();
+
                 Ok(ColumnarValue::Array(Arc::new(StringArray::from(result))))
             }
 
