@@ -7,11 +7,13 @@ use llama_cpp_2::{
     model::{AddBos, LlamaModel, Special, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
-use std::{num::NonZeroU32, pin::pin};
-pub struct LlamaApp {
-    backend: LlamaBackend,
-    model: LlamaModel,
-}
+use std::{num::NonZeroU32, pin::pin, sync::Mutex};
+
+static LLAMA_BACKEND: tokio::sync::OnceCell<LlamaBackend> = tokio::sync::OnceCell::const_new();
+static LLAMA_MODEL: tokio::sync::OnceCell<Mutex<LlamaModel>> = tokio::sync::OnceCell::const_new();
+
+#[derive(Debug)]
+pub struct LlamaApp {}
 
 impl LlamaApp {
     /// Creates a new instance by loading a given model file from disk.
@@ -19,13 +21,16 @@ impl LlamaApp {
         // Initialize the backend
         let mut backend = LlamaBackend::init().context("Failed to initialize LLaMA backend")?;
         backend.void_logs(); // => remove this line if you want to see the logs
+
         // Set up model parameters (you can customize as needed)
-        let model_params = LlamaModelParams::default().with_use_mlock(true);
+        let model_params = LlamaModelParams::default();
         let model_params = pin!(model_params);
         // Load the model from file
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .with_context(|| format!("Unable to load model from path: {model_path}"))?;
-        Ok(Self { backend, model })
+        LLAMA_BACKEND.set(backend);
+        LLAMA_MODEL.set(Mutex::new(model));
+        Ok(Self {})
     }
 
     /// Generates text given a prompt.
@@ -40,18 +45,20 @@ impl LlamaApp {
         // Create context parameters (controls how many tokens the context can hold)
         let ctx_params =
             LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()));
+
+        let model = LLAMA_MODEL.get().unwrap().lock().unwrap();
+        let backend = LLAMA_BACKEND.get().unwrap();
+
         // Create a context for this model
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
+        let mut ctx = model
+            .new_context(backend, ctx_params)
             .context("Unable to create LLaMA context")?;
 
         // Build a sampler (decides how to pick tokens)
         let mut sampler = build_sampler(seed, temp);
 
         // Convert prompt to tokens (including a BOS token at the start)
-        let tokens = self
-            .model
+        let tokens = model
             .str_to_token(prompt, AddBos::Always)
             .with_context(|| format!("Failed to tokenize prompt: {prompt}"))?;
 
@@ -81,13 +88,13 @@ impl LlamaApp {
             sampler.accept(token);
 
             // 2) Check for end-of-generation token
-            if self.model.is_eog_token(token) {
+            if model.is_eog_token(token) {
                 // Stop generation
                 break;
             }
 
             // 3) Convert token to UTF-8 and append to output
-            let token_bytes = self.model.token_to_bytes(token, Special::Tokenize)?;
+            let token_bytes = model.token_to_bytes(token, Special::Tokenize)?;
             let mut decode_buffer = String::with_capacity(32);
             {
                 let mut decoder = UTF_8.new_decoder();
@@ -107,15 +114,61 @@ impl LlamaApp {
     }
 }
 
+/// Build the sampler (decides how to pick next tokens).
 fn build_sampler(seed: Option<u32>, temp: f32) -> LlamaSampler {
-    LlamaSampler::chain_simple([
-        LlamaSampler::dist(seed.unwrap_or_default()),
-        LlamaSampler::top_k(40),
-        LlamaSampler::top_p(0.95, 10),
-        LlamaSampler::temp(temp.max(0.2)),
-        LlamaSampler::mirostat_v2(seed.unwrap_or_default(), 5.0, 0.1),
-        LlamaSampler::penalties(64, 1.05, 0.0, 0.0),
-    ])
+    // A sampler pipeline: random distribution + greedy pick.
+    // You can extend or replace with your own logic (top-k, top-p, etc.)
+    let sampler = LlamaSampler::chain_simple([
+        LlamaSampler::dist(seed.unwrap_or(1234)),
+        LlamaSampler::greedy(),
+        LlamaSampler::temp(temp),
+        //LlamaSampler::min_p(0.2, 10),
+    ]);
+    sampler
 }
 
-// LLM utility functions for datafusion UDFs
+/// Helper function to create a prompt for the LLM
+pub fn get_prompt(instruction: &str, column_values: &[String]) -> String {
+    let column_values_str = column_values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| format!("{}. {}", i + 1, value))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an AI evaluator that processes lists of items according to specific criteria.
+Always respond with ONLY comma-separated values matching the exact number and order of input items. 
+For ratings, use only the specified numbers, or categories, For yes/no questions, use only 'yes' or 'no'.
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+{instruction}:
+{column_values_str}
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_llama_app_creation() {
+        // Replace with a path to a real model for testing
+        let model_path = "models/llama_df_ai.Q4_K_M.gguf";
+        let llama_app = LlamaApp::new(model_path).unwrap();
+        let prompt = get_prompt(
+            "Rate how likely these customers are to become repeat buyers as likely, neutral, or unlikely",
+            &[
+                "Excellent experience!".to_string(),
+                "Wrong item delivered.".to_string(),
+                "Fast delivery, great service!".to_string(),
+            ],
+        );
+        println!("prompt: {}", prompt);
+        let res = llama_app.generate_text(&prompt, 512, 0.1, None).unwrap();
+        println!("res: {}", res);
+        assert_eq!(res.trim(), "1 -> likely\n2 -> unlikely\n3 -> likely");
+    }
+}

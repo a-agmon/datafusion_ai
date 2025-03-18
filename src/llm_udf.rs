@@ -1,16 +1,16 @@
-use crate::llm_utils::LlamaApp;
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::DataType;
-use datafusion_common::cast::{as_int64_array, as_string_array};
+use datafusion_common::cast::as_string_array;
 use datafusion_common::{DataFusionError, Result, ScalarValue, plan_err};
 use datafusion_doc::Documentation;
-use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, Signature, Volatility, col};
-use datafusion_expr::{ScalarUDF, ScalarUDFImpl};
+use datafusion_expr::ScalarUDFImpl;
+use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, Signature, Volatility};
 use datafusion_macros::user_doc;
 use rayon::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::LazyLock;
+
+use crate::llm_utils::{LlamaApp, get_prompt};
 
 /// This struct for a simple UDF that adds one to an int32
 #[user_doc(
@@ -21,27 +21,51 @@ use std::sync::LazyLock;
 #[derive(Debug)]
 pub struct AskLLM {
     signature: Signature,
-    aliases: Vec<String>,
+    llama_app: LlamaApp,
 }
 
 impl AskLLM {
-    /// Create a new instance of the `PowUdf` struct
+    /// Create a new instance of the UDF
     pub fn new() -> Self {
         Self {
             signature: Signature::exact(
-                // this function will always take two arguments of type string
                 vec![DataType::Utf8, DataType::Utf8],
-                // this function is deterministic and will always return the same
-                // result for the same input
                 Volatility::Immutable,
             ),
-            // we will also add an alias of "my_pow"
-            aliases: vec!["ask_llm".to_string()],
+            llama_app: LlamaApp::new("models/llama_df_ai.Q4_K_M.gguf")
+                .expect("Failed to initialize LlamaApp"),
         }
+    }
+
+    fn process_chunk(&self, instruction: &str, vals: &[String]) -> Result<Vec<String>> {
+        let mut records_outcome: Vec<String> = Vec::with_capacity(vals.len());
+        if vals.is_empty() {
+            println!("vals is empty");
+            return Ok(records_outcome);
+        }
+        let prompt = get_prompt(instruction, vals);
+        let text = self
+            .llama_app
+            .generate_text(&prompt, 512, 0.0, None)
+            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+        let values: Vec<String> = parse_llm_response(&text);
+        if values.len() == vals.len() {
+            records_outcome.extend(values);
+        } else {
+            let message = format!(
+                "Error: mismatched result count: {} != {}. results: {:?}",
+                values.len(),
+                vals.len(),
+                values
+            );
+            records_outcome.extend(vec![message; vals.len()]);
+        }
+
+        Ok(records_outcome)
     }
 }
 
-/// Implement the ScalarUDFImpl trait for AddOne
+/// Implement the ScalarUDFImpl trait for AskLLM
 impl ScalarUDFImpl for AskLLM {
     fn as_any(&self) -> &dyn Any {
         self
@@ -58,7 +82,7 @@ impl ScalarUDFImpl for AskLLM {
         }
         Ok(DataType::Utf8)
     }
-    // The actual implementation would add one to the argument
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { mut args, .. } = args;
         assert_eq!(args.len(), 2);
@@ -75,19 +99,21 @@ impl ScalarUDFImpl for AskLLM {
                 let col_values = as_string_array(col_values.as_ref())?;
                 println!("instruction: {:?}", instruction);
                 let values: Vec<_> = col_values.iter().collect();
-                let chunk_size = 10; // Choose appropriate chunk size based on data volume
-
+                let chunk_size = 5;
+                // Process chunks in parallel using Rayon
                 let result: Vec<String> = values
                     .par_chunks(chunk_size)
+                    //.chunks(chunk_size)
                     .flat_map(|chunk| {
-                        chunk
+                        let vals: Vec<String> = chunk
                             .iter()
-                            .map(|value| {
-                                let num_words =
-                                    value.unwrap_or_default().split_whitespace().count();
-                                format!("{} words", num_words)
-                            })
-                            .collect::<Vec<_>>()
+                            .map(|opt| opt.unwrap_or_default().to_string())
+                            .collect();
+                        let instruction_str = instruction.as_deref().unwrap_or_default();
+                        match self.process_chunk(instruction_str, &vals) {
+                            Ok(records) => records,
+                            Err(e) => vec![format!("Error processing chunk: {}", e); vals.len()],
+                        }
                     })
                     .collect();
 
@@ -95,11 +121,25 @@ impl ScalarUDFImpl for AskLLM {
             }
 
             _ => {
-                return plan_err!("ask_llm only accepts Utf8 arguments");
+                return plan_err!(
+                    "ask_llm only accepts 2 arguments in the form of 'instruction' (string), 'column_value' (column)"
+                );
             }
         }
     }
+
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }
+}
+
+fn parse_llm_response(input: &str) -> Vec<String> {
+    input
+        .lines()
+        .filter_map(|line| {
+            line.split("->")
+                .nth(1)
+                .map(|value| value.trim().to_string())
+        })
+        .collect()
 }

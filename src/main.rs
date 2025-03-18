@@ -26,10 +26,12 @@ async fn main() -> datafusion::error::Result<()> {
     let ask_llm = ScalarUDF::from(llm_udf::AskLLM::new());
     ctx.register_udf(ask_llm.clone());
     let query = r#"
-    SELECT "Order ID", "Customer ID", "Customer Feedback", 
-        ask_llm('how satisfied is the customer [1-10]', "Customer Feedback") 
+    SELECT 
+        "Order ID", "Customer ID", "Customer Feedback", 
+        ask_llm('Rate the satisfaction level of the customer as satisfied, neutral, or dissatisfied', "Customer Feedback") 
+        as satisfaction_level
     FROM sample_table 
-    limit 50
+    limit 20
     "#;
     let time_start = Instant::now();
     let df = ctx.sql(query).await?;
