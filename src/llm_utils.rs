@@ -7,10 +7,10 @@ use llama_cpp_2::{
     model::{AddBos, LlamaModel, Special, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
-use std::{num::NonZeroU32, pin::pin, sync::Mutex};
+use std::{num::NonZeroU32, pin::pin};
 
 static LLAMA_BACKEND: tokio::sync::OnceCell<LlamaBackend> = tokio::sync::OnceCell::const_new();
-static LLAMA_MODEL: tokio::sync::OnceCell<Mutex<LlamaModel>> = tokio::sync::OnceCell::const_new();
+static LLAMA_MODEL: tokio::sync::OnceCell<LlamaModel> = tokio::sync::OnceCell::const_new();
 
 #[derive(Debug)]
 pub struct LlamaApp {}
@@ -19,8 +19,8 @@ impl LlamaApp {
     /// Creates a new instance by loading a given model file from disk.
     pub fn new(model_path: &str) -> anyhow::Result<Self> {
         // Initialize the backend
-        let mut backend = LlamaBackend::init().context("Failed to initialize LLaMA backend")?;
-        backend.void_logs(); // => remove this line if you want to see the logs
+        let backend = LlamaBackend::init().context("Failed to initialize LLaMA backend")?;
+        //backend.void_logs(); // => remove this line if you want to see the logs
 
         // Set up model parameters (you can customize as needed)
         let model_params = LlamaModelParams::default();
@@ -28,8 +28,8 @@ impl LlamaApp {
         // Load the model from file
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .with_context(|| format!("Unable to load model from path: {model_path}"))?;
-        LLAMA_BACKEND.set(backend);
-        LLAMA_MODEL.set(Mutex::new(model));
+        LLAMA_BACKEND.set(backend)?;
+        LLAMA_MODEL.set(model)?;
         Ok(Self {})
     }
 
@@ -46,7 +46,7 @@ impl LlamaApp {
         let ctx_params =
             LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()));
 
-        let model = LLAMA_MODEL.get().unwrap().lock().unwrap();
+        let model = LLAMA_MODEL.get().unwrap();
         let backend = LLAMA_BACKEND.get().unwrap();
 
         // Create a context for this model
@@ -80,7 +80,7 @@ impl LlamaApp {
         let mut output_text = String::new();
         let max_generation_tokens = (ctx_size as i32) - prompt_length;
         let mut n_cur = batch.n_tokens();
-        // We'll generate until we hit 1000 tokens or an EOG (end-of-generation) token
+        // We'll generate until we hit max tokens or an EOG (end-of-generation) token
         while n_cur <= max_generation_tokens {
             // 1) Sample next token
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);

@@ -31,7 +31,7 @@ async fn main() -> datafusion::error::Result<()> {
         ask_llm('Rate the satisfaction level of the customer as satisfied, neutral, or dissatisfied', "Customer Feedback") 
         as satisfaction_level
     FROM sample_table 
-    limit 20
+    limit 50
     "#;
     let time_start = Instant::now();
     let df = ctx.sql(query).await?;

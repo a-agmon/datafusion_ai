@@ -99,11 +99,11 @@ impl ScalarUDFImpl for AskLLM {
                 let col_values = as_string_array(col_values.as_ref())?;
                 println!("instruction: {:?}", instruction);
                 let values: Vec<_> = col_values.iter().collect();
-                let chunk_size = 5;
+                let chunk_size = 10;
                 // Process chunks in parallel using Rayon
                 let result: Vec<String> = values
-                    .par_chunks(chunk_size)
-                    //.chunks(chunk_size)
+                    //.par_chunks(chunk_size)
+                    .chunks(chunk_size)
                     .flat_map(|chunk| {
                         let vals: Vec<String> = chunk
                             .iter()
