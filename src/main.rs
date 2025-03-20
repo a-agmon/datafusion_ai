@@ -4,6 +4,7 @@ use datafusion::prelude::*;
 use datafusion_expr::ScalarUDF;
 mod llm_udf;
 mod llm_utils;
+mod ollama_utils;
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     // register the table
@@ -15,23 +16,15 @@ async fn main() -> datafusion::error::Result<()> {
     )
     .await?;
 
-    // create a plan to run a SQL query
-    let df = ctx
-        .sql("SELECT `Order ID`, `Customer ID`, `Customer Feedback` FROM sample_table limit 10")
-        .await?;
-
-    // execute and print results
-    df.show().await?;
-
     let ask_llm = ScalarUDF::from(llm_udf::AskLLM::new());
     ctx.register_udf(ask_llm.clone());
     let query = r#"
     SELECT 
         "Order ID", "Customer ID", "Customer Feedback", 
-        ask_llm('Rate the satisfaction level of the customer as satisfied, neutral, or dissatisfied', "Customer Feedback") 
-        as satisfaction_level
+        ask_llm('Categorize customer feedback as positive, negative, or neutral', "Customer Feedback") 
+        as sentiment
     FROM sample_table 
-    limit 50
+    limit 100
     "#;
     let time_start = Instant::now();
     let df = ctx.sql(query).await?;

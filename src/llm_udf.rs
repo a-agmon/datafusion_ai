@@ -9,10 +9,15 @@ use datafusion_macros::user_doc;
 use rayon::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::llm_utils::{LlamaApp, get_prompt};
+use crate::ollama_utils::OllamaApp;
 
-/// This struct for a simple UDF that adds one to an int32
+// Thread-local runtime creator function so that we can use async calls in sync contexts
+fn create_tokio_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
+}
+
 #[user_doc(
     doc_section(label = "AI functions"),
     description = "Ask LLM",
@@ -21,44 +26,49 @@ use crate::llm_utils::{LlamaApp, get_prompt};
 #[derive(Debug)]
 pub struct AskLLM {
     signature: Signature,
-    llama_app: LlamaApp,
+    ollama_model: String,
+    ollama_url: String,
 }
 
 impl AskLLM {
-    /// Create a new instance of the UDF
     pub fn new() -> Self {
         Self {
             signature: Signature::exact(
                 vec![DataType::Utf8, DataType::Utf8],
                 Volatility::Immutable,
             ),
-            llama_app: LlamaApp::new("models/llama_df_ai.Q4_K_M.gguf")
-                .expect("Failed to initialize LlamaApp"),
+            ollama_model: "llama32-df:latest".to_string(),
+            ollama_url: "http://localhost:11434/api/chat".to_string(),
         }
     }
 
-    fn process_chunk(&self, instruction: &str, vals: &[String]) -> Result<Vec<String>> {
+    // this function process a chunk of rows and will be called in parallel using rayon
+    async fn process_chunk(&self, instruction: &str, vals: &[String]) -> Result<Vec<String>> {
         let mut records_outcome: Vec<String> = Vec::with_capacity(vals.len());
         if vals.is_empty() {
             println!("vals is empty");
             return Ok(records_outcome);
         }
-        let prompt = get_prompt(instruction, vals);
-        let text = self
-            .llama_app
-            .generate_text(&prompt, 512, 0.0, None)
+        let ollama_app = OllamaApp::new(&self.ollama_model, &self.ollama_url)
             .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-        let values: Vec<String> = parse_llm_response(&text);
-        if values.len() == vals.len() {
-            records_outcome.extend(values);
+
+        let llm_response = ollama_app
+            .generate_text(instruction, vals)
+            .await
+            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+
+        let evaluated_values: Vec<String> = parse_llm_response(&llm_response);
+        // sanity check that the number of results is the same as the number of input values
+        if evaluated_values.len() == vals.len() {
+            records_outcome.extend(evaluated_values);
         } else {
-            let message = format!(
+            let error_message = format!(
                 "Error: mismatched result count: {} != {}. results: {:?}",
-                values.len(),
+                evaluated_values.len(),
                 vals.len(),
-                values
+                evaluated_values
             );
-            records_outcome.extend(vec![message; vals.len()]);
+            records_outcome.extend(vec![error_message; vals.len()]);
         }
 
         Ok(records_outcome)
@@ -99,18 +109,22 @@ impl ScalarUDFImpl for AskLLM {
                 let col_values = as_string_array(col_values.as_ref())?;
                 println!("instruction: {:?}", instruction);
                 let values: Vec<_> = col_values.iter().collect();
-                let chunk_size = 10;
-                // Process chunks in parallel using Rayon
+                let chunk_size = 5;
+
                 let result: Vec<String> = values
-                    //.par_chunks(chunk_size)
-                    .chunks(chunk_size)
+                    .par_chunks(chunk_size)
                     .flat_map(|chunk| {
+                        // first we extract the column values from the chunk
                         let vals: Vec<String> = chunk
                             .iter()
                             .map(|opt| opt.unwrap_or_default().to_string())
                             .collect();
+                        // then we extract the instruction in the UDF
                         let instruction_str = instruction.as_deref().unwrap_or_default();
-                        match self.process_chunk(instruction_str, &vals) {
+                        let time_start = Instant::now();
+                        let rt = create_tokio_runtime();
+                        println!("runtime created in {:?}", time_start.elapsed());
+                        match rt.block_on(self.process_chunk(instruction_str, &vals)) {
                             Ok(records) => records,
                             Err(e) => vec![format!("Error processing chunk: {}", e); vals.len()],
                         }
